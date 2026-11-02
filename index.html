@@ -675,6 +675,19 @@
     #winTxt { max-width: 44vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   }
   @media (prefers-reduced-motion: reduce) { .view-enter, .view-glitch { animation: none; } #glitchFx { display: none; } .campaign-card:hover { transform: none; } }
+
+  /* ---------- Indicador de sincronización ---------- */
+  .sync-pill { display: inline-flex; align-items: center; gap: 7px; font-size: 10px; letter-spacing: .14em; color: #8a9bb2; background: #080d15; border: 1px solid #1a2740; padding: 4px 10px; cursor: pointer; white-space: nowrap;
+    clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut)); }
+  .sync-pill b { font-weight: 600; }
+  .sync-pill i { width: 6px; height: 6px; border-radius: 50%; background: #475569; display: inline-block; }
+  .sync-pill:hover { border-color: rgba(0,229,255,.5); color: #fff; }
+  .sync-pill[data-state="ok"] i   { background: #35e08e; box-shadow: 0 0 6px rgba(53,224,142,.8); }
+  .sync-pill[data-state="ok"] b   { color: #35e08e; }
+  .sync-pill[data-state="busy"] i { background: #facc15; box-shadow: 0 0 6px rgba(250,204,21,.7); }
+  .sync-pill[data-state="busy"] b { color: #facc15; }
+  .sync-pill[data-state="err"] i  { background: #FA383E; box-shadow: 0 0 6px rgba(250,56,62,.7); }
+  .sync-pill[data-state="err"] b  { color: #FA383E; }
 </style>
 </head>
 <body>
@@ -779,6 +792,7 @@
       <span class="text-xs text-gray-400 font-mono hidden md:inline-block">Console Pro</span>
       <span class="flex-1"></span>
       <span class="hud-status font-mono hidden sm:inline-flex"><i></i>SYS ONLINE · <b id="hudClock">--:--:--</b></span>
+      <button type="button" class="sync-pill font-mono" id="syncPill" data-state="off" title="Sincronización" onclick="window.cloud.pull()"><i></i><b>LOCAL</b></button>
       <span class="text-xs font-mono text-[#2D88FF] bg-[#0d121d] border border-[#1e293b] px-3 py-1 rounded" id="winTxt">//Metricas</span>
     </div>
   </header>
@@ -1068,7 +1082,7 @@
       <p class="text-[10.5px] font-mono text-gray-500 mt-3 leading-relaxed">
         Haz clic en un día del calendario para ver sus tareas y precargar esa fecha en el formulario.
         Las fechas límite de piezas aún no entregadas en //Seguimiento.Piezas aparecen en <span style="color:#35e08e">verde</span>.
-        Los pendientes se guardan en este navegador.
+        Los pendientes se sincronizan entre dispositivos (indicador SYNC arriba a la derecha).
       </p>
     </div>
 
@@ -1157,7 +1171,7 @@
       <p class="text-[10.5px] font-mono text-gray-500 mt-3 leading-relaxed">
         Lo que agregas en //Gestor.Piezas entra aquí automáticamente como <span style="color:#facc15">Solicitado</span>.
         La demora corre desde la fecha de solicitud hasta la fecha de entrega, que se fija sola al pasar a Publicado o Activo (puedes corregirla en la tabla).
-        Los registros se guardan en este navegador.
+        Los registros se sincronizan entre dispositivos.
       </p>
     </div>
 
@@ -1174,6 +1188,198 @@ const fmtN = n => Number(Math.round(n || 0)).toLocaleString('en-US');
 const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 let active = 'metricas';
+
+// =========================================================================
+// SYNC — datos compartidos entre dispositivos (API /api en Vercel + Blob)
+// Calendario, Seguimiento y cola del Gestor se guardan como JSON; las bases
+// META / matriz se guardan como el archivo original y cada dispositivo lo
+// vuelve a procesar al abrir. Sin API disponible, todo sigue en modo local.
+// =========================================================================
+window.cloud = (function () {
+  const API = '/api';
+  const STATE_KEYS = ['pendientes', 'seguimiento', 'gestor', 'files'];
+  const SLOT_TARGET = { ma: 'se1', se: 'se2', crm: 'crm' };
+  const REV_KEY = 'cassandra.sync.v1';
+  const POLL_MS = 20000;
+  const MAX_FILE = 4 * 1024 * 1024;
+
+  const handlers = {};      // key -> { get, hasData, apply }
+  const dirty = {};         // key -> payload pendiente de subir
+  const timers = {};
+  const fileRev = {};       // slot -> rev ya cargado en esta pestaña
+  const loading = {};
+  let revs = {};            // key -> último rev aplicado o enviado
+  let filesMeta = {};       // { ma: { name, size, rev, at }, ... }
+  let online = false, started = false, lastErr = '';
+
+  try { revs = JSON.parse(localStorage.getItem(REV_KEY) || '{}') || {}; } catch (e) { revs = {}; }
+  const saveRevs = () => { try { localStorage.setItem(REV_KEY, JSON.stringify(revs)); } catch (e) {} };
+  const newRev = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+  function status(state, msg) {
+    const pill = document.getElementById('syncPill');
+    if (!pill) return;
+    const txt = { ok: 'SYNC', busy: 'SYNC…', off: 'LOCAL', err: 'SYNC ✗' }[state] || state;
+    pill.dataset.state = state;
+    pill.querySelector('b').textContent = txt;
+    const base = {
+      ok: 'Sincronizado: los cambios se comparten entre dispositivos',
+      busy: 'Sincronizando…',
+      off: 'Sin conexión a la nube: los cambios quedan solo en este navegador',
+      err: 'Error de sincronización'
+    }[state] || '';
+    pill.title = msg ? base + ' · ' + msg : base;
+  }
+
+  function register(key, h) { handlers[key] = h; if (started) pull(); }
+
+  // Cambio local -> se sube con un pequeño retraso (agrupa ediciones seguidas)
+  function push(key, data) {
+    const payload = Object.assign({}, data, { rev: newRev(), at: Date.now() });
+    revs[key] = payload.rev; saveRevs();
+    dirty[key] = payload;
+    clearTimeout(timers[key]);
+    timers[key] = setTimeout(() => flush(key), 500);
+  }
+
+  async function flush(key) {
+    const payload = dirty[key];
+    if (!payload || !online) return;
+    status('busy');
+    try {
+      const r = await fetch(`${API}/state?key=${key}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status);
+      if (dirty[key] === payload) delete dirty[key];
+      status(Object.keys(dirty).length ? 'busy' : 'ok');
+    } catch (e) { lastErr = e.message; status('err', e.message); }
+  }
+
+  const keyOf = x => (x && x.id) ? 'id:' + x.id : 'j:' + JSON.stringify(x);
+
+  let pullP = null;
+  function pull() {
+    if (!pullP) pullP = doPull().finally(() => { pullP = null; });
+    return pullP;
+  }
+
+  async function doPull() {
+    try {
+      const r = await fetch(`${API}/state?keys=${STATE_KEYS.join(',')}`, { cache: 'no-store' });
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('json')) throw new Error('API no disponible (' + r.status + ')');
+      const all = await r.json();
+      if (!r.ok) throw new Error(all.error || 'HTTP ' + r.status);
+      online = true;
+
+      ['pendientes', 'seguimiento', 'gestor'].forEach(key => {
+        const h = handlers[key];
+        if (!h || dirty[key]) return;
+        const remote = all[key];
+        if (!remote) {
+          // Primera vez en la nube: sube lo que este navegador ya tenía
+          if (!revs[key] && h.hasData()) push(key, h.get());
+          return;
+        }
+        if (remote.rev === revs[key]) return;
+        if (!revs[key] && h.hasData()) {
+          // Primer sync de este navegador: une lo local con lo de la nube
+          const theirs = Array.isArray(remote.items) ? remote.items : [];
+          const seen = new Set(theirs.map(keyOf));
+          const merged = theirs.concat((h.get().items || []).filter(x => !seen.has(keyOf(x))));
+          h.apply({ items: merged });
+          if (merged.length !== theirs.length) { push(key, { items: merged }); return; }
+        } else {
+          h.apply(remote);
+        }
+        revs[key] = remote.rev; saveRevs();
+      });
+
+      // Bases: carga la última versión de cada casilla si cambió
+      if (!dirty.files) filesMeta = Object.assign({}, (all.files && all.files.slots) || {});
+      Object.keys(SLOT_TARGET).forEach(slot => {
+        const m = filesMeta[slot];
+        if (m && m.rev && m.rev !== fileRev[slot] && !loading[slot]) loadFile(slot, m);
+      });
+
+      Object.keys(dirty).forEach(flush);
+      if (!Object.keys(dirty).length) status('ok');
+    } catch (e) {
+      online = false;
+      lastErr = e.message;
+      status('off', e.message);
+    }
+  }
+
+  async function loadFile(slot, meta) {
+    loading[slot] = true;
+    try {
+      const r = await fetch(`${API}/file?slot=${slot}`, { cache: 'no-store' });
+      if (!r.ok) throw new Error('No se pudo descargar ' + meta.name);
+      const blob = await r.blob();
+      const file = new File([blob], meta.name || slot + '.xlsx');
+      await new Promise(done => processUpload(file, SLOT_TARGET[slot], {
+        fromCloud: true,
+        onDone: ok => { if (ok) fileRev[slot] = meta.rev; done(); }
+      }));
+    } catch (e) { status('err', e.message); }
+    finally { loading[slot] = false; }
+  }
+
+  async function pushFile(slot, file) {
+    if (!SLOT_TARGET[slot]) return;
+    if (!online) await pull();
+    if (!online) { status('off', 'La base quedó solo en este dispositivo'); return; }
+    if (file.size > MAX_FILE) { status('err', `${file.name} supera 4 MB: quedó solo en este dispositivo`); return; }
+    status('busy');
+    try {
+      const r = await fetch(`${API}/file?slot=${slot}`, { method: 'PUT', body: file });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status);
+      const rev = newRev();
+      fileRev[slot] = rev;
+      filesMeta = Object.assign({}, filesMeta, { [slot]: { name: file.name, size: file.size, rev, at: Date.now() } });
+      push('files', { slots: filesMeta });
+    } catch (e) { status('err', 'Base no sincronizada: ' + e.message); }
+  }
+
+  function start() {
+    if (started) return;
+    started = true;
+    status('busy');
+    pull();
+    setInterval(() => { if (!document.hidden) pull(); }, POLL_MS);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) pull(); });
+    window.addEventListener('focus', pull);
+    window.addEventListener('online', pull);
+  }
+
+  return { register, push, pushFile, pull, start, get online() { return online; } };
+})();
+
+// Cola del //Gestor.Piezas (el módulo vive en un iframe y la lee/escribe aquí)
+window.gestorStore = (function () {
+  const KEY = 'cassandra.gestor.v1';
+  let data = [];
+  try { data = JSON.parse(localStorage.getItem(KEY) || '[]'); if (!Array.isArray(data)) data = []; } catch (e) { data = []; }
+  const clone = a => JSON.parse(JSON.stringify(a || []));
+  const persist = () => { try { localStorage.setItem(KEY, JSON.stringify(data)); } catch (e) {} };
+
+  function load() { return clone(data); }
+  function save(arr) { data = clone(arr); persist(); window.cloud.push('gestor', { items: data }); }
+
+  window.cloud.register('gestor', {
+    get: () => ({ items: data }),
+    hasData: () => data.length > 0,
+    apply: remote => {
+      data = Array.isArray(remote.items) ? clone(remote.items) : [];
+      persist();
+      try {
+        const f = document.getElementById('piezasFrame');
+        if (f && f.contentWindow && f.contentWindow.gestorReload) f.contentWindow.gestorReload(load());
+      } catch (e) {}
+    }
+  });
+  return { load, save };
+})();
 
 // =========================================================================
 // BOOT SEQUENCE v2 — encendido CRT + arranque holográfico + validación META
@@ -1406,7 +1612,7 @@ bootStart();
 // =========================================================================
 // //GESTOR.PIEZAS — módulo embebido (carga perezosa)
 // =========================================================================
-const PIEZAS_HTML = "<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Gestor de Solicitud de Piezas</title>\n    \n    <!-- Tailwind CSS -->\n    <script src=\"https://cdn.tailwindcss.com\"><\/script>\n    <!-- ExcelJS -->\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js\"><\/script>\n    <!-- FileSaver -->\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js\"><\/script>\n    \n    <link href=\"https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap\" rel=\"stylesheet\">\n    <style>\n        :root {\n          --bg-app: #080b11;\n          --bg-card: #0d121d;\n          --bg-card-sub: #131a29;\n          --border-color: #1e293b;\n          --border-cyan: #00f0ff;\n          --text-main: #e2e8f0;\n          --text-muted: #64748b;\n          --color-blue: #2D88FF;\n          --color-cyan: #00f0ff;\n        }\n        body { font-family: 'Inter', sans-serif; background-color: var(--bg-app); }\n        .font-mono { font-family: 'JetBrains Mono', 'Roboto Mono', monospace; }\n        .fade-in { animation: fadeIn 0.35s ease-out; }\n        @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }\n\n        /* Custom scrollbar (tema oscuro) */\n        ::-webkit-scrollbar { height: 8px; width: 8px; }\n        ::-webkit-scrollbar-track { background: var(--bg-app); }\n        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }\n        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }\n        /* Cyberpunk skin */\n        body { background-image: linear-gradient(rgba(45,136,255,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(45,136,255,.05) 1px, transparent 1px); background-size: 44px 44px; }\n        .max-w-7xl { position: relative; border-color: rgba(0,240,255,.2) !important; border-radius: 4px !important; }\n        .max-w-7xl::before, .max-w-7xl::after { content: ''; position: absolute; width: 12px; height: 12px; pointer-events: none; z-index: 2; }\n        .max-w-7xl::before { top: 0; left: 0; border-top: 1px solid #00f0ff; border-left: 1px solid #00f0ff; }\n        .max-w-7xl::after { bottom: 0; right: 0; border-bottom: 1px solid #00f0ff; border-right: 1px solid #00f0ff; }\n        h1 { text-shadow: 0 0 14px rgba(0,240,255,.25); }\n        input, select, textarea { border-radius: 3px !important; background-color: #0a1019 !important; }\n        input:focus, select:focus, textarea:focus { border-color: #00f0ff !important; box-shadow: 0 0 0 1px rgba(0,240,255,.25), 0 0 12px rgba(0,240,255,.18) !important; outline: none; }\n        form, .rounded-xl { border-radius: 4px !important; }\n        button[type=submit], #exportarBtn { border-radius: 0 !important; clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px); }\n        thead { background: rgba(0,240,255,.04) !important; }\n        th { color: #7dd3e0 !important; }\n    </style>\n</head>\n<body class=\"bg-[#080b11] text-[#e2e8f0] antialiased min-h-screen flex flex-col items-center py-8 px-4 sm:px-6 lg:px-8\">\n\n    <div class=\"w-full max-w-7xl bg-[#0d121d] shadow-2xl rounded-2xl overflow-hidden border border-[#1e293b]\">\n        <div class=\"px-8 py-6 flex justify-between items-center bg-[#0b0f19] border-b border-[#1e293b]\">\n            <div>\n                <h1 class=\"text-xl font-bold text-white tracking-tight flex items-center font-mono\">\n                    <svg class=\"w-6 h-6 mr-3 text-[#2D88FF]\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z\"></path></svg>\n                    //Gestor.Piezas\n                </h1>\n                <p class=\"text-gray-400 mt-1 text-xs font-mono\">Complete los detalles para agregar a la cola de exportaci\u00f3n.</p>\n            </div>\n        </div>\n\n        <div class=\"p-8\">\n            <form id=\"solicitudForm\" class=\"grid grid-cols-1 md:grid-cols-12 gap-6 mb-8 bg-[#0b0f19] p-6 rounded-xl border border-[#1e293b] shadow-sm\">\n                \n                <!-- Fila 1: T y Carrera -->\n                <div class=\"md:col-span-3\">\n                    <label for=\"campoT\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">T (Tipo)</label>\n                    <select id=\"campoT\" required class=\"w-full rounded-lg border border-[#1e293b] px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] bg-[#131a29] text-white shadow-sm transition-all\">\n                        <option value=\"SE\">SE</option>\n                        <option value=\"MA\">MA</option>\n                        <option value=\"DI\">DI</option>\n                        <option value=\"DO\">DO</option>\n                    </select>\n                </div>\n\n                <div class=\"md:col-span-9\">\n                    <label for=\"carrera\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">CARRERA</label>\n                    <input type=\"text\" id=\"carrera\" required class=\"w-full rounded-lg border border-[#1e293b] px-4 py-2.5 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"Ej: Ingenier\u00eda de Software\">\n                </div>\n\n                <div class=\"md:col-span-12\">\n                    <label class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1 flex items-center justify-between\">\n                        <span>Referencias (Links)</span>\n                        <span class=\"text-[10px] text-gray-500 font-normal normal-case\">M\u00e1ximo 5 links</span>\n                    </label>\n                    <div id=\"links-container\" class=\"space-y-2\">\n                        <div class=\"flex items-center gap-2\">\n                            <input type=\"text\" class=\"link-slot w-full rounded-lg border border-[#1e293b] px-4 py-2 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"https://ejemplo.com/referencia1\">\n                            <button type=\"button\" onclick=\"addLinkSlot()\" id=\"btnAddLink\" class=\"bg-[#2D88FF]/10 text-[#2D88FF] hover:bg-[#2D88FF]/20 border border-[#2D88FF]/30 p-2.5 rounded-lg transition-colors shadow-sm flex-shrink-0\" title=\"Agregar otro link\">\n                                <svg class=\"w-5 h-5\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M12 4v16m8-8H4\"></path></svg>\n                            </button>\n                        </div>\n                    </div>\n                </div>\n\n                <div class=\"md:col-span-6\">\n                    <label for=\"formato\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">Formato de piezas</label>\n                    <select id=\"formato\" required class=\"w-full rounded-lg border border-[#1e293b] px-4 py-2.5 bg-[#131a29] text-white focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\">\n                        <option value=\"1080 X 1080\">1080 X 1080</option>\n                        <option value=\"1200 X 628\">1200 X 628</option>\n                        <option value=\"1920 X 1080\">1920 X 1080</option>\n                        <option value=\"(RR.SS)&#10;1080 X 1080&#10;1200 X 628&#10;1920 X 1080\">Todas (RR.SS)</option>\n                    </select>\n                </div>\n\n                <div class=\"md:col-span-6\">\n                    <label for=\"estado\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">ESTADO</label>\n                    <input type=\"text\" id=\"estado\" value=\"Pendiente\" readonly class=\"w-full rounded-lg border border-amber-500/30 px-4 py-2.5 bg-amber-500/10 text-amber-300 font-medium shadow-sm cursor-not-allowed select-none focus:outline-none\">\n                </div>\n\n                <div class=\"md:col-span-12\">\n                    <div class=\"flex justify-between items-center mb-1\">\n                        <label for=\"observaciones\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400\">Observaciones</label>\n                        <button type=\"button\" onclick=\"generarCTA()\" class=\"text-[10px] font-mono font-bold bg-purple-500/10 text-purple-300 hover:bg-purple-500/20 px-3 py-1.5 rounded-full transition-colors flex items-center shadow-sm border border-purple-500/30\">\n                            <svg class=\"w-3.5 h-3.5 mr-1\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M13 10V3L4 14h7v7l9-11h-7z\"></path></svg>\n                            + Generar CTA Aleatorio\n                        </button>\n                    </div>\n                    <textarea id=\"observaciones\" rows=\"3\" class=\"w-full rounded-lg border border-[#1e293b] px-4 py-3 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all resize-y\" placeholder=\"A\u00f1ade detalles, copys adicionales, etc.\"></textarea>\n                </div>\n\n                <!-- Bot\u00f3n de Env\u00edo -->\n                <div class=\"md:col-span-12 flex justify-end mt-2 pt-4 border-t border-[#1e293b]\">\n                    <button type=\"submit\" class=\"bg-[#2D88FF] hover:bg-blue-600 text-white font-mono font-bold text-sm py-3 px-8 rounded-lg shadow-md hover:shadow-lg transition-colors flex items-center\">\n                        <svg class=\"w-5 h-5 mr-2\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4\"></path></svg>\n                        Agregar a la Lista\n                    </button>\n                </div>\n            </form>\n\n            <div>\n                <div class=\"flex flex-col sm:flex-row justify-between items-center mb-4\">\n                    <h2 class=\"text-sm font-bold uppercase tracking-wider text-gray-300 font-mono mb-4 sm:mb-0\">Cola de Solicitudes</h2>\n                    <button id=\"exportarBtn\" class=\"bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-sm py-2.5 px-6 rounded-lg shadow-md transition-colors flex items-center opacity-50 cursor-not-allowed\" disabled>\n                        <svg class=\"w-5 h-5 mr-2\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4\"></path></svg>\n                        Exportar a Excel\n                    </button>\n                </div>\n\n                <div class=\"overflow-x-auto rounded-xl border border-[#1e293b] shadow-sm\">\n                    <table class=\"min-w-full divide-y divide-[#1e293b]\">\n                        <thead class=\"bg-[#131a29]\">\n                            <tr>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-16\">T</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider min-w-[150px]\">Carrera</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider min-w-[200px]\">Referencias</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider min-w-[250px]\">Observaciones</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-32\">Formato</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-24\">Estado</th>\n                                <th class=\"px-4 py-3 text-right text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-20\">Acci\u00f3n</th>\n                            </tr>\n                        </thead>\n                        <tbody id=\"tablaBody\" class=\"bg-[#0d121d] divide-y divide-[#1e293b]\">\n                            <tr id=\"emptyState\">\n                                <td colspan=\"7\" class=\"px-6 py-12 text-center text-sm text-gray-500 font-mono\">\n                                    No hay solicitudes ingresadas. Usa el formulario superior.\n                                </td>\n                            </tr>\n                        </tbody>\n                    </table>\n                </div>\n            </div>\n        </div>\n    </div>\n\n    <script>\n        let datosSolicitud = [];\n        const form = document.getElementById('solicitudForm');\n        const tablaBody = document.getElementById('tablaBody');\n        const emptyState = document.getElementById('emptyState');\n        const exportarBtn = document.getElementById('exportarBtn');\n        const linksContainer = document.getElementById('links-container');\n\n        // CTAs Predise\u00f1ados\n        const ctas = [\n            \"\u00a1Comienza ahora!\", \n            \"Matric\u00falate hoy\", \n            \"Impulsa tu carrera\",\n            \"Descubre m\u00e1s\", \n            \"Inscr\u00edbete aqu\u00ed\", \n            \"Da el primer paso\",\n            \"Asegura tu vacante\", \n            \"Transforma tu futuro\",\n            \"Solicita m\u00e1s informaci\u00f3n\", \n            \"\u00danete a nuestra comunidad\"\n        ];\n\n        function generarCTA() {\n            const obs = document.getElementById('observaciones');\n            const randomCTA = ctas[Math.floor(Math.random() * ctas.length)];\n            \n            // Si ya hay texto, agregamos salto de l\u00ednea\n            if (obs.value.trim() !== '') {\n                obs.value += '\\n';\n            }\n            obs.value += `CTA: ${randomCTA}`;\n            \n            // Peque\u00f1a animaci\u00f3n visual en el textarea\n            obs.classList.add('ring-2', 'ring-purple-400');\n            setTimeout(() => {\n                obs.classList.remove('ring-2', 'ring-purple-400');\n            }, 400);\n        }\n\n        // L\u00f3gica para Links M\u00faltiples (Slots)\n        let linkCount = 1;\n        function addLinkSlot() {\n            if (linkCount >= 5) {\n                // Prevenir m\u00e1s de 5 slots sin usar alert\n                const btn = document.getElementById('btnAddLink');\n                btn.classList.add('opacity-50', 'cursor-not-allowed');\n                return;\n            }\n\n            const div = document.createElement('div');\n            div.className = 'flex items-center gap-2 fade-in mt-2';\n            div.innerHTML = `\n                <input type=\"text\" class=\"link-slot w-full rounded-lg border border-[#1e293b] px-4 py-2 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"Link adicional\">\n                <button type=\"button\" onclick=\"removeLinkSlot(this)\" class=\"text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 p-2.5 rounded-lg transition-colors flex-shrink-0\" title=\"Eliminar link\">\n                    <svg class=\"w-5 h-5\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16\"></path></svg>\n                </button>\n            `;\n            linksContainer.appendChild(div);\n            linkCount++;\n        }\n\n        function removeLinkSlot(btnElement) {\n            btnElement.parentElement.remove();\n            linkCount--;\n            document.getElementById('btnAddLink').classList.remove('opacity-50', 'cursor-not-allowed');\n        }\n\n        function getLinksText() {\n            const inputs = document.querySelectorAll('.link-slot');\n            const validLinks = Array.from(inputs)\n                                   .map(input => input.value.trim())\n                                   .filter(val => val !== '');\n            return validLinks.join('\\n'); // Une los links con saltos de l\u00ednea\n        }\n\n        function resetLinks() {\n            // Dejar solo 1 slot limpio\n            linksContainer.innerHTML = `\n                <div class=\"flex items-center gap-2\">\n                    <input type=\"text\" class=\"link-slot w-full rounded-lg border border-[#1e293b] px-4 py-2 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"https://ejemplo.com/referencia1\">\n                    <button type=\"button\" onclick=\"addLinkSlot()\" id=\"btnAddLink\" class=\"bg-[#2D88FF]/10 text-[#2D88FF] hover:bg-[#2D88FF]/20 border border-[#2D88FF]/30 p-2.5 rounded-lg transition-colors shadow-sm flex-shrink-0\" title=\"Agregar otro link\">\n                        <svg class=\"w-5 h-5\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M12 4v16m8-8H4\"></path></svg>\n                    </button>\n                </div>\n            `;\n            linkCount = 1;\n        }\n\n        form.addEventListener('submit', function(e) {\n            e.preventDefault();\n\n            const nuevaSolicitud = {\n                t: document.getElementById('campoT').value,\n                carrera: document.getElementById('carrera').value.trim(),\n                referencias: getLinksText(),\n                observaciones: document.getElementById('observaciones').value.trim(),\n                formato: document.getElementById('formato').value,\n                estado: document.getElementById('estado').value\n            };\n\n            datosSolicitud.push(nuevaSolicitud);\n            try { if (window.parent && window.parent.seguimiento) window.parent.seguimiento.addFromGestor(nuevaSolicitud); } catch (err) {}\n            actualizarTabla();\n            \n            // Limpiar form\n            document.getElementById('carrera').value = '';\n            document.getElementById('observaciones').value = '';\n            resetLinks();\n            document.getElementById('carrera').focus();\n        });\n\n        function actualizarTabla() {\n            tablaBody.innerHTML = '';\n\n            if (datosSolicitud.length === 0) {\n                tablaBody.appendChild(emptyState);\n                exportarBtn.disabled = true;\n                exportarBtn.classList.add('opacity-50', 'cursor-not-allowed');\n                return;\n            }\n\n            exportarBtn.disabled = false;\n            exportarBtn.classList.remove('opacity-50', 'cursor-not-allowed');\n\n            datosSolicitud.forEach((item, index) => {\n                const tr = document.createElement('tr');\n                tr.className = 'hover:bg-white/5 transition-colors fade-in';\n                \n                // Usamos whitespace-pre-line en celdas que puedan tener \\n (links, obs, formatos)\n                tr.innerHTML = `\n                    <td class=\"px-4 py-4 text-sm font-bold font-mono text-[#2D88FF] bg-[#2D88FF]/5\">${item.t}</td>\n                    <td class=\"px-4 py-4 text-sm font-medium text-white\">${item.carrera}</td>\n                    <td class=\"px-4 py-4 text-sm text-gray-400 whitespace-pre-line break-all\">${item.referencias || '-'}</td>\n                    <td class=\"px-4 py-4 text-sm text-gray-400 whitespace-pre-line\">${item.observaciones || '-'}</td>\n                    <td class=\"px-4 py-4 text-sm font-medium text-gray-300 whitespace-pre-line\">${item.formato}</td>\n                    <td class=\"px-4 py-4 text-sm\">\n                        <span class=\"px-2.5 py-1 inline-flex text-xs leading-5 font-semibold rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/20\">\n                            ${item.estado}\n                        </span>\n                    </td>\n                    <td class=\"px-4 py-4 text-right text-sm\">\n                        <button onclick=\"eliminarFila(${index})\" class=\"text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 p-2 rounded-md transition-colors\" title=\"Eliminar\">\n                            <svg class=\"w-4 h-4\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16\"></path></svg>\n                        </button>\n                    </td>\n                `;\n                tablaBody.appendChild(tr);\n            });\n        }\n\n        function eliminarFila(index) {\n            datosSolicitud.splice(index, 1);\n            actualizarTabla();\n        }\n\n        exportarBtn.addEventListener('click', async function() {\n            if (datosSolicitud.length === 0) return;\n\n            const workbook = new ExcelJS.Workbook();\n            const sheet = workbook.addWorksheet('Solicitudes');\n\n            // Estilos\n            const borderThin = {\n                top: {style:'thin'}, left: {style:'thin'}, \n                bottom: {style:'thin'}, right: {style:'thin'}\n            };\n            const centerAlign = { vertical: 'middle', horizontal: 'center' };\n            const topAlignWrap = { vertical: 'top', horizontal: 'left', wrapText: true };\n            const blueFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4472C4' } }; // Azul oscuro encabezado\n            \n            // Fecha para titulo y archivo\n            const hoy = new Date();\n            const dd = String(hoy.getDate()).padStart(2, '0');\n            const mm = String(hoy.getMonth() + 1).padStart(2, '0');\n            const yy = String(hoy.getFullYear()).slice(-2);\n            const yyyy = hoy.getFullYear();\n\n            // Fila 1: T\u00edtulo Global\n            sheet.mergeCells('A1:F1');\n            const titleCell = sheet.getCell('A1');\n            titleCell.value = `SOLICITUD DE PIEZAS - ${dd}/${mm}/${yyyy}`;\n            titleCell.font = { color: { argb: 'FFFFFFFF' }, bold: true, size: 12 };\n            titleCell.fill = blueFill;\n            titleCell.alignment = centerAlign;\n            for (let c = 1; c <= 6; c++) { sheet.getCell(1, c).border = borderThin; }\n\n            // Fila 2: Cabeceras\n            const headers = ['T', 'CARRERA', 'Referencias', 'Observaciones', 'Formato de piezas', 'ESTADO'];\n            const headerRow = sheet.addRow(headers);\n            headerRow.eachCell((cell) => {\n                cell.fill = blueFill;\n                cell.font = { color: { argb: 'FFFFFFFF' }, bold: true };\n                cell.alignment = centerAlign;\n                cell.border = borderThin;\n            });\n            headerRow.height = 25;\n\n            // Datos\n            datosSolicitud.forEach(item => {\n                const row = sheet.addRow([\n                    item.t,\n                    item.carrera,\n                    item.referencias, // Ya contiene los \\n provenientes del HTML\n                    item.observaciones, // Puede contener los CTA a\u00f1adidos con \\n\n                    item.formato,     // Contiene los \\n si escogi\u00f3 \"Todas (RR.SS)\"\n                    item.estado\n                ]);\n\n                // Auto-altura aproximada para permitir ver bien los saltos de l\u00ednea\n                row.height = 80;\n\n                row.eachCell((cell, colNumber) => {\n                    cell.border = borderThin;\n                    \n                    if (colNumber === 1) { \n                        // Col A (T): Fondo azul clarito, centrado\n                        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF8EA9DB' } }; \n                        cell.alignment = centerAlign;\n                    } else if (colNumber === 6) { \n                        // Col F (Estado): Fondo amarillo clarito, centrado\n                        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF2CC' } }; \n                        cell.alignment = centerAlign;\n                    } else {\n                        // Resto: Alineado arriba a la izquierda y con WordWrap activo\n                        cell.alignment = topAlignWrap;\n                    }\n                });\n            });\n\n            // Anchos de Columna en el Excel\n            sheet.getColumn(1).width = 8;   \n            sheet.getColumn(2).width = 30;  \n            sheet.getColumn(3).width = 40;  // M\u00e1s ancho para los links\n            sheet.getColumn(4).width = 45;  \n            sheet.getColumn(5).width = 25;  \n            sheet.getColumn(6).width = 15;  \n\n            // Descarga\n            const buffer = await workbook.xlsx.writeBuffer();\n            const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });\n            \n            const nombreArchivo = `SOLICITUD DE PIEZAS - ${dd}${mm}${yy}.xlsx`;\n            saveAs(blob, nombreArchivo);\n        });\n    <\/script>\n</body>\n</html>";
+const PIEZAS_HTML = "<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Gestor de Solicitud de Piezas</title>\n    \n    <!-- Tailwind CSS -->\n    <script src=\"https://cdn.tailwindcss.com\"><\/script>\n    <!-- ExcelJS -->\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js\"><\/script>\n    <!-- FileSaver -->\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js\"><\/script>\n    \n    <link href=\"https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap\" rel=\"stylesheet\">\n    <style>\n        :root {\n          --bg-app: #080b11;\n          --bg-card: #0d121d;\n          --bg-card-sub: #131a29;\n          --border-color: #1e293b;\n          --border-cyan: #00f0ff;\n          --text-main: #e2e8f0;\n          --text-muted: #64748b;\n          --color-blue: #2D88FF;\n          --color-cyan: #00f0ff;\n        }\n        body { font-family: 'Inter', sans-serif; background-color: var(--bg-app); }\n        .font-mono { font-family: 'JetBrains Mono', 'Roboto Mono', monospace; }\n        .fade-in { animation: fadeIn 0.35s ease-out; }\n        @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }\n\n        /* Custom scrollbar (tema oscuro) */\n        ::-webkit-scrollbar { height: 8px; width: 8px; }\n        ::-webkit-scrollbar-track { background: var(--bg-app); }\n        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }\n        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }\n        /* Cyberpunk skin */\n        body { background-image: linear-gradient(rgba(45,136,255,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(45,136,255,.05) 1px, transparent 1px); background-size: 44px 44px; }\n        .max-w-7xl { position: relative; border-color: rgba(0,240,255,.2) !important; border-radius: 4px !important; }\n        .max-w-7xl::before, .max-w-7xl::after { content: ''; position: absolute; width: 12px; height: 12px; pointer-events: none; z-index: 2; }\n        .max-w-7xl::before { top: 0; left: 0; border-top: 1px solid #00f0ff; border-left: 1px solid #00f0ff; }\n        .max-w-7xl::after { bottom: 0; right: 0; border-bottom: 1px solid #00f0ff; border-right: 1px solid #00f0ff; }\n        h1 { text-shadow: 0 0 14px rgba(0,240,255,.25); }\n        input, select, textarea { border-radius: 3px !important; background-color: #0a1019 !important; }\n        input:focus, select:focus, textarea:focus { border-color: #00f0ff !important; box-shadow: 0 0 0 1px rgba(0,240,255,.25), 0 0 12px rgba(0,240,255,.18) !important; outline: none; }\n        form, .rounded-xl { border-radius: 4px !important; }\n        button[type=submit], #exportarBtn { border-radius: 0 !important; clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px); }\n        thead { background: rgba(0,240,255,.04) !important; }\n        th { color: #7dd3e0 !important; }\n    </style>\n</head>\n<body class=\"bg-[#080b11] text-[#e2e8f0] antialiased min-h-screen flex flex-col items-center py-8 px-4 sm:px-6 lg:px-8\">\n\n    <div class=\"w-full max-w-7xl bg-[#0d121d] shadow-2xl rounded-2xl overflow-hidden border border-[#1e293b]\">\n        <div class=\"px-8 py-6 flex justify-between items-center bg-[#0b0f19] border-b border-[#1e293b]\">\n            <div>\n                <h1 class=\"text-xl font-bold text-white tracking-tight flex items-center font-mono\">\n                    <svg class=\"w-6 h-6 mr-3 text-[#2D88FF]\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z\"></path></svg>\n                    //Gestor.Piezas\n                </h1>\n                <p class=\"text-gray-400 mt-1 text-xs font-mono\">Complete los detalles para agregar a la cola de exportaci\u00f3n.</p>\n            </div>\n        </div>\n\n        <div class=\"p-8\">\n            <form id=\"solicitudForm\" class=\"grid grid-cols-1 md:grid-cols-12 gap-6 mb-8 bg-[#0b0f19] p-6 rounded-xl border border-[#1e293b] shadow-sm\">\n                \n                <!-- Fila 1: T y Carrera -->\n                <div class=\"md:col-span-3\">\n                    <label for=\"campoT\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">T (Tipo)</label>\n                    <select id=\"campoT\" required class=\"w-full rounded-lg border border-[#1e293b] px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] bg-[#131a29] text-white shadow-sm transition-all\">\n                        <option value=\"SE\">SE</option>\n                        <option value=\"MA\">MA</option>\n                        <option value=\"DI\">DI</option>\n                        <option value=\"DO\">DO</option>\n                    </select>\n                </div>\n\n                <div class=\"md:col-span-9\">\n                    <label for=\"carrera\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">CARRERA</label>\n                    <input type=\"text\" id=\"carrera\" required class=\"w-full rounded-lg border border-[#1e293b] px-4 py-2.5 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"Ej: Ingenier\u00eda de Software\">\n                </div>\n\n                <div class=\"md:col-span-12\">\n                    <label class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1 flex items-center justify-between\">\n                        <span>Referencias (Links)</span>\n                        <span class=\"text-[10px] text-gray-500 font-normal normal-case\">M\u00e1ximo 5 links</span>\n                    </label>\n                    <div id=\"links-container\" class=\"space-y-2\">\n                        <div class=\"flex items-center gap-2\">\n                            <input type=\"text\" class=\"link-slot w-full rounded-lg border border-[#1e293b] px-4 py-2 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"https://ejemplo.com/referencia1\">\n                            <button type=\"button\" onclick=\"addLinkSlot()\" id=\"btnAddLink\" class=\"bg-[#2D88FF]/10 text-[#2D88FF] hover:bg-[#2D88FF]/20 border border-[#2D88FF]/30 p-2.5 rounded-lg transition-colors shadow-sm flex-shrink-0\" title=\"Agregar otro link\">\n                                <svg class=\"w-5 h-5\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M12 4v16m8-8H4\"></path></svg>\n                            </button>\n                        </div>\n                    </div>\n                </div>\n\n                <div class=\"md:col-span-6\">\n                    <label for=\"formato\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">Formato de piezas</label>\n                    <select id=\"formato\" required class=\"w-full rounded-lg border border-[#1e293b] px-4 py-2.5 bg-[#131a29] text-white focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\">\n                        <option value=\"1080 X 1080\">1080 X 1080</option>\n                        <option value=\"1200 X 628\">1200 X 628</option>\n                        <option value=\"1920 X 1080\">1920 X 1080</option>\n                        <option value=\"(RR.SS)&#10;1080 X 1080&#10;1200 X 628&#10;1920 X 1080\">Todas (RR.SS)</option>\n                    </select>\n                </div>\n\n                <div class=\"md:col-span-6\">\n                    <label for=\"estado\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400 mb-1\">ESTADO</label>\n                    <input type=\"text\" id=\"estado\" value=\"Pendiente\" readonly class=\"w-full rounded-lg border border-amber-500/30 px-4 py-2.5 bg-amber-500/10 text-amber-300 font-medium shadow-sm cursor-not-allowed select-none focus:outline-none\">\n                </div>\n\n                <div class=\"md:col-span-12\">\n                    <div class=\"flex justify-between items-center mb-1\">\n                        <label for=\"observaciones\" class=\"block text-xs font-mono uppercase tracking-wider text-gray-400\">Observaciones</label>\n                        <button type=\"button\" onclick=\"generarCTA()\" class=\"text-[10px] font-mono font-bold bg-purple-500/10 text-purple-300 hover:bg-purple-500/20 px-3 py-1.5 rounded-full transition-colors flex items-center shadow-sm border border-purple-500/30\">\n                            <svg class=\"w-3.5 h-3.5 mr-1\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M13 10V3L4 14h7v7l9-11h-7z\"></path></svg>\n                            + Generar CTA Aleatorio\n                        </button>\n                    </div>\n                    <textarea id=\"observaciones\" rows=\"3\" class=\"w-full rounded-lg border border-[#1e293b] px-4 py-3 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all resize-y\" placeholder=\"A\u00f1ade detalles, copys adicionales, etc.\"></textarea>\n                </div>\n\n                <!-- Bot\u00f3n de Env\u00edo -->\n                <div class=\"md:col-span-12 flex justify-end mt-2 pt-4 border-t border-[#1e293b]\">\n                    <button type=\"submit\" class=\"bg-[#2D88FF] hover:bg-blue-600 text-white font-mono font-bold text-sm py-3 px-8 rounded-lg shadow-md hover:shadow-lg transition-colors flex items-center\">\n                        <svg class=\"w-5 h-5 mr-2\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4\"></path></svg>\n                        Agregar a la Lista\n                    </button>\n                </div>\n            </form>\n\n            <div>\n                <div class=\"flex flex-col sm:flex-row justify-between items-center mb-4\">\n                    <h2 class=\"text-sm font-bold uppercase tracking-wider text-gray-300 font-mono mb-4 sm:mb-0\">Cola de Solicitudes</h2>\n                    <button id=\"exportarBtn\" class=\"bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-sm py-2.5 px-6 rounded-lg shadow-md transition-colors flex items-center opacity-50 cursor-not-allowed\" disabled>\n                        <svg class=\"w-5 h-5 mr-2\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4\"></path></svg>\n                        Exportar a Excel\n                    </button>\n                </div>\n\n                <div class=\"overflow-x-auto rounded-xl border border-[#1e293b] shadow-sm\">\n                    <table class=\"min-w-full divide-y divide-[#1e293b]\">\n                        <thead class=\"bg-[#131a29]\">\n                            <tr>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-16\">T</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider min-w-[150px]\">Carrera</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider min-w-[200px]\">Referencias</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider min-w-[250px]\">Observaciones</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-32\">Formato</th>\n                                <th class=\"px-4 py-3 text-left text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-24\">Estado</th>\n                                <th class=\"px-4 py-3 text-right text-[10px] font-mono font-bold text-gray-400 uppercase tracking-wider w-20\">Acci\u00f3n</th>\n                            </tr>\n                        </thead>\n                        <tbody id=\"tablaBody\" class=\"bg-[#0d121d] divide-y divide-[#1e293b]\">\n                            <tr id=\"emptyState\">\n                                <td colspan=\"7\" class=\"px-6 py-12 text-center text-sm text-gray-500 font-mono\">\n                                    No hay solicitudes ingresadas. Usa el formulario superior.\n                                </td>\n                            </tr>\n                        </tbody>\n                    </table>\n                </div>\n            </div>\n        </div>\n    </div>\n\n    <script>\n        let datosSolicitud = [];\n        try { if (window.parent && window.parent.gestorStore) datosSolicitud = window.parent.gestorStore.load(); } catch (e) {}\n        const escH = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n        function guardarCola() { try { if (window.parent && window.parent.gestorStore) window.parent.gestorStore.save(datosSolicitud); } catch (e) {} }\n        window.gestorReload = function (data) { datosSolicitud = Array.isArray(data) ? data : []; actualizarTabla(); };\n        const form = document.getElementById('solicitudForm');\n        const tablaBody = document.getElementById('tablaBody');\n        const emptyState = document.getElementById('emptyState');\n        const exportarBtn = document.getElementById('exportarBtn');\n        const linksContainer = document.getElementById('links-container');\n\n        // CTAs Predise\u00f1ados\n        const ctas = [\n            \"\u00a1Comienza ahora!\", \n            \"Matric\u00falate hoy\", \n            \"Impulsa tu carrera\",\n            \"Descubre m\u00e1s\", \n            \"Inscr\u00edbete aqu\u00ed\", \n            \"Da el primer paso\",\n            \"Asegura tu vacante\", \n            \"Transforma tu futuro\",\n            \"Solicita m\u00e1s informaci\u00f3n\", \n            \"\u00danete a nuestra comunidad\"\n        ];\n\n        function generarCTA() {\n            const obs = document.getElementById('observaciones');\n            const randomCTA = ctas[Math.floor(Math.random() * ctas.length)];\n            \n            // Si ya hay texto, agregamos salto de l\u00ednea\n            if (obs.value.trim() !== '') {\n                obs.value += '\\n';\n            }\n            obs.value += `CTA: ${randomCTA}`;\n            \n            // Peque\u00f1a animaci\u00f3n visual en el textarea\n            obs.classList.add('ring-2', 'ring-purple-400');\n            setTimeout(() => {\n                obs.classList.remove('ring-2', 'ring-purple-400');\n            }, 400);\n        }\n\n        // L\u00f3gica para Links M\u00faltiples (Slots)\n        let linkCount = 1;\n        function addLinkSlot() {\n            if (linkCount >= 5) {\n                // Prevenir m\u00e1s de 5 slots sin usar alert\n                const btn = document.getElementById('btnAddLink');\n                btn.classList.add('opacity-50', 'cursor-not-allowed');\n                return;\n            }\n\n            const div = document.createElement('div');\n            div.className = 'flex items-center gap-2 fade-in mt-2';\n            div.innerHTML = `\n                <input type=\"text\" class=\"link-slot w-full rounded-lg border border-[#1e293b] px-4 py-2 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"Link adicional\">\n                <button type=\"button\" onclick=\"removeLinkSlot(this)\" class=\"text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 p-2.5 rounded-lg transition-colors flex-shrink-0\" title=\"Eliminar link\">\n                    <svg class=\"w-5 h-5\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16\"></path></svg>\n                </button>\n            `;\n            linksContainer.appendChild(div);\n            linkCount++;\n        }\n\n        function removeLinkSlot(btnElement) {\n            btnElement.parentElement.remove();\n            linkCount--;\n            document.getElementById('btnAddLink').classList.remove('opacity-50', 'cursor-not-allowed');\n        }\n\n        function getLinksText() {\n            const inputs = document.querySelectorAll('.link-slot');\n            const validLinks = Array.from(inputs)\n                                   .map(input => input.value.trim())\n                                   .filter(val => val !== '');\n            return validLinks.join('\\n'); // Une los links con saltos de l\u00ednea\n        }\n\n        function resetLinks() {\n            // Dejar solo 1 slot limpio\n            linksContainer.innerHTML = `\n                <div class=\"flex items-center gap-2\">\n                    <input type=\"text\" class=\"link-slot w-full rounded-lg border border-[#1e293b] px-4 py-2 bg-[#131a29] text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#2D88FF] focus:border-[#2D88FF] shadow-sm transition-all\" placeholder=\"https://ejemplo.com/referencia1\">\n                    <button type=\"button\" onclick=\"addLinkSlot()\" id=\"btnAddLink\" class=\"bg-[#2D88FF]/10 text-[#2D88FF] hover:bg-[#2D88FF]/20 border border-[#2D88FF]/30 p-2.5 rounded-lg transition-colors shadow-sm flex-shrink-0\" title=\"Agregar otro link\">\n                        <svg class=\"w-5 h-5\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M12 4v16m8-8H4\"></path></svg>\n                    </button>\n                </div>\n            `;\n            linkCount = 1;\n        }\n\n        form.addEventListener('submit', function(e) {\n            e.preventDefault();\n\n            const nuevaSolicitud = {\n                t: document.getElementById('campoT').value,\n                carrera: document.getElementById('carrera').value.trim(),\n                referencias: getLinksText(),\n                observaciones: document.getElementById('observaciones').value.trim(),\n                formato: document.getElementById('formato').value,\n                estado: document.getElementById('estado').value\n            };\n\n            datosSolicitud.push(nuevaSolicitud);\n            guardarCola();\n            try { if (window.parent && window.parent.seguimiento) window.parent.seguimiento.addFromGestor(nuevaSolicitud); } catch (err) {}\n            actualizarTabla();\n            \n            // Limpiar form\n            document.getElementById('carrera').value = '';\n            document.getElementById('observaciones').value = '';\n            resetLinks();\n            document.getElementById('carrera').focus();\n        });\n\n        function actualizarTabla() {\n            tablaBody.innerHTML = '';\n\n            if (datosSolicitud.length === 0) {\n                tablaBody.appendChild(emptyState);\n                exportarBtn.disabled = true;\n                exportarBtn.classList.add('opacity-50', 'cursor-not-allowed');\n                return;\n            }\n\n            exportarBtn.disabled = false;\n            exportarBtn.classList.remove('opacity-50', 'cursor-not-allowed');\n\n            datosSolicitud.forEach((item, index) => {\n                const tr = document.createElement('tr');\n                tr.className = 'hover:bg-white/5 transition-colors fade-in';\n                \n                // Usamos whitespace-pre-line en celdas que puedan tener \\n (links, obs, formatos)\n                tr.innerHTML = `\n                    <td class=\"px-4 py-4 text-sm font-bold font-mono text-[#2D88FF] bg-[#2D88FF]/5\">${escH(item.t)}</td>\n                    <td class=\"px-4 py-4 text-sm font-medium text-white\">${escH(item.carrera)}</td>\n                    <td class=\"px-4 py-4 text-sm text-gray-400 whitespace-pre-line break-all\">${escH(item.referencias) || '-'}</td>\n                    <td class=\"px-4 py-4 text-sm text-gray-400 whitespace-pre-line\">${escH(item.observaciones) || '-'}</td>\n                    <td class=\"px-4 py-4 text-sm font-medium text-gray-300 whitespace-pre-line\">${escH(item.formato)}</td>\n                    <td class=\"px-4 py-4 text-sm\">\n                        <span class=\"px-2.5 py-1 inline-flex text-xs leading-5 font-semibold rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/20\">\n                            ${escH(item.estado)}\n                        </span>\n                    </td>\n                    <td class=\"px-4 py-4 text-right text-sm\">\n                        <button onclick=\"eliminarFila(${index})\" class=\"text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 p-2 rounded-md transition-colors\" title=\"Eliminar\">\n                            <svg class=\"w-4 h-4\" fill=\"none\" stroke=\"currentColor\" viewBox=\"0 0 24 24\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16\"></path></svg>\n                        </button>\n                    </td>\n                `;\n                tablaBody.appendChild(tr);\n            });\n        }\n\n        function eliminarFila(index) {\n            datosSolicitud.splice(index, 1);\n            guardarCola();\n            actualizarTabla();\n        }\n\n        exportarBtn.addEventListener('click', async function() {\n            if (datosSolicitud.length === 0) return;\n\n            const workbook = new ExcelJS.Workbook();\n            const sheet = workbook.addWorksheet('Solicitudes');\n\n            // Estilos\n            const borderThin = {\n                top: {style:'thin'}, left: {style:'thin'}, \n                bottom: {style:'thin'}, right: {style:'thin'}\n            };\n            const centerAlign = { vertical: 'middle', horizontal: 'center' };\n            const topAlignWrap = { vertical: 'top', horizontal: 'left', wrapText: true };\n            const blueFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4472C4' } }; // Azul oscuro encabezado\n            \n            // Fecha para titulo y archivo\n            const hoy = new Date();\n            const dd = String(hoy.getDate()).padStart(2, '0');\n            const mm = String(hoy.getMonth() + 1).padStart(2, '0');\n            const yy = String(hoy.getFullYear()).slice(-2);\n            const yyyy = hoy.getFullYear();\n\n            // Fila 1: T\u00edtulo Global\n            sheet.mergeCells('A1:F1');\n            const titleCell = sheet.getCell('A1');\n            titleCell.value = `SOLICITUD DE PIEZAS - ${dd}/${mm}/${yyyy}`;\n            titleCell.font = { color: { argb: 'FFFFFFFF' }, bold: true, size: 12 };\n            titleCell.fill = blueFill;\n            titleCell.alignment = centerAlign;\n            for (let c = 1; c <= 6; c++) { sheet.getCell(1, c).border = borderThin; }\n\n            // Fila 2: Cabeceras\n            const headers = ['T', 'CARRERA', 'Referencias', 'Observaciones', 'Formato de piezas', 'ESTADO'];\n            const headerRow = sheet.addRow(headers);\n            headerRow.eachCell((cell) => {\n                cell.fill = blueFill;\n                cell.font = { color: { argb: 'FFFFFFFF' }, bold: true };\n                cell.alignment = centerAlign;\n                cell.border = borderThin;\n            });\n            headerRow.height = 25;\n\n            // Datos\n            datosSolicitud.forEach(item => {\n                const row = sheet.addRow([\n                    item.t,\n                    item.carrera,\n                    item.referencias, // Ya contiene los \\n provenientes del HTML\n                    item.observaciones, // Puede contener los CTA a\u00f1adidos con \\n\n                    item.formato,     // Contiene los \\n si escogi\u00f3 \"Todas (RR.SS)\"\n                    item.estado\n                ]);\n\n                // Auto-altura aproximada para permitir ver bien los saltos de l\u00ednea\n                row.height = 80;\n\n                row.eachCell((cell, colNumber) => {\n                    cell.border = borderThin;\n                    \n                    if (colNumber === 1) { \n                        // Col A (T): Fondo azul clarito, centrado\n                        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF8EA9DB' } }; \n                        cell.alignment = centerAlign;\n                    } else if (colNumber === 6) { \n                        // Col F (Estado): Fondo amarillo clarito, centrado\n                        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF2CC' } }; \n                        cell.alignment = centerAlign;\n                    } else {\n                        // Resto: Alineado arriba a la izquierda y con WordWrap activo\n                        cell.alignment = topAlignWrap;\n                    }\n                });\n            });\n\n            // Anchos de Columna en el Excel\n            sheet.getColumn(1).width = 8;   \n            sheet.getColumn(2).width = 30;  \n            sheet.getColumn(3).width = 40;  // M\u00e1s ancho para los links\n            sheet.getColumn(4).width = 45;  \n            sheet.getColumn(5).width = 25;  \n            sheet.getColumn(6).width = 15;  \n\n            // Descarga\n            const buffer = await workbook.xlsx.writeBuffer();\n            const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });\n            \n            const nombreArchivo = `SOLICITUD DE PIEZAS - ${dd}${mm}${yy}.xlsx`;\n            saveAs(blob, nombreArchivo);\n        });\n\n        actualizarTabla();\n    <\/script>\n</body>\n</html>";
 let piezasLoaded = false;
 function loadPiezasFrame() {
   if (piezasLoaded) return;
@@ -2221,7 +2427,8 @@ function setUploadStat(el, state, full, short) {
   el.className = 'text-[11px] font-mono px-2 py-1 bg-[#131a29] rounded border ' + color;
 }
 
-function processUpload(file, typeTarget) {
+// opts.fromCloud: la base viene de la nube (no se vuelve a subir) · opts.onDone(ok)
+function processUpload(file, typeTarget, opts = {}) {
   const suffix = typeTarget.replace('se1', 'ma').replace('se2', 'se');
   const els = [document.getElementById('stat-' + suffix), document.getElementById('boot-stat-' + suffix)];
   els.forEach(el => setUploadStat(el, 'busy', 'Procesando...', 'PROCESANDO…'));
@@ -2255,12 +2462,16 @@ function processUpload(file, typeTarget) {
         full = `✓ ${processed.rows.length} registros cargados${skippedTxt}`;
         short = `✓ ${processed.rows.length}`;
       }
+      if (opts.fromCloud) full += ` · ${file.name} (nube)`;
       els.forEach(el => setUploadStat(el, 'ok', full, short));
       renderAll();
       checkBootReady();
+      if (!opts.fromCloud && window.cloud) window.cloud.pushFile(suffix, file);
+      if (opts.onDone) opts.onDone(true);
     } catch (err) {
       els.forEach(el => setUploadStat(el, 'err', '✗ Error: ' + err.message, '✗ ERROR'));
       checkBootReady();
+      if (opts.onDone) opts.onDone(false);
     }
   };
   // CSV como texto UTF-8 (evita tildes rotas tipo "GestiÃ³n"); Excel como binario
@@ -2453,6 +2664,7 @@ function rebuildFilters() {
 
 window.seguimiento = (function () {
   const KEY = 'cassandra.seguimiento.v1';
+  const CLOUD_KEY = 'seguimiento';
   const ESTADOS = ['Solicitado', 'Publicado', 'Activo'];
   let items = [];
   let filtro = '__all';
@@ -2469,7 +2681,8 @@ window.seguimiento = (function () {
     try { const raw = localStorage.getItem(KEY); items = raw ? JSON.parse(raw) : []; if (!Array.isArray(items)) items = []; }
     catch (e) { items = []; }
   }
-  function save() { try { localStorage.setItem(KEY, JSON.stringify(items)); } catch (e) {} }
+  function persistLocal() { try { localStorage.setItem(KEY, JSON.stringify(items)); } catch (e) {} }
+  function save() { persistLocal(); if (window.cloud) window.cloud.push(CLOUD_KEY, { items }); }
 
   // Demora = solicitud → entrega. Sin entrega, cuenta hasta hoy (en curso).
   function demora(it) {
@@ -2680,6 +2893,17 @@ window.seguimiento = (function () {
   load();
   render();
 
+  if (window.cloud) window.cloud.register(CLOUD_KEY, {
+    get: () => ({ items }),
+    hasData: () => items.length > 0,
+    apply: remote => {
+      items = Array.isArray(remote.items) ? remote.items : [];
+      persistLocal();
+      render();
+      if (window.pendientes) window.pendientes.render(); // fechas límite en el calendario
+    }
+  });
+
   return { add, addFromGestor, render };
 })();
 
@@ -2691,6 +2915,7 @@ window.seguimiento = (function () {
 // =========================================================================
 window.pendientes = (function () {
   const KEY = 'cassandra.pendientes.v1';
+  const CLOUD_KEY = 'pendientes';
   const SEG_KEY = 'cassandra.seguimiento.v1';
   const PRIO_ORDER = { Alta: 0, Media: 1, Baja: 2 };
   const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
@@ -2714,7 +2939,8 @@ window.pendientes = (function () {
     try { const raw = localStorage.getItem(KEY); items = raw ? JSON.parse(raw) : []; if (!Array.isArray(items)) items = []; }
     catch (e) { items = []; }
   }
-  function save() { try { localStorage.setItem(KEY, JSON.stringify(items)); } catch (e) {} }
+  function persistLocal() { try { localStorage.setItem(KEY, JSON.stringify(items)); } catch (e) {} }
+  function save() { persistLocal(); if (window.cloud) window.cloud.push(CLOUD_KEY, { items }); }
 
   const isLate = t => !t.done && t.fecha < todayISO();
   const sortTasks = (a, b) => (a.done - b.done) || a.fecha.localeCompare(b.fecha) || (PRIO_ORDER[a.prio] - PRIO_ORDER[b.prio]);
@@ -2897,6 +3123,17 @@ window.pendientes = (function () {
 
   load();
   render();
+
+  if (window.cloud) window.cloud.register(CLOUD_KEY, {
+    get: () => ({ items }),
+    hasData: () => items.length > 0,
+    apply: remote => {
+      items = Array.isArray(remote.items) ? remote.items : [];
+      persistLocal();
+      render();
+    }
+  });
+
   return { add, render };
 })();
 
@@ -2939,6 +3176,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.mgr.syncData();
   rebuildFilters();
   renderAll();
+  window.cloud.start();
 });
 </script>
 </body>
